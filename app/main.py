@@ -12,6 +12,7 @@ API:
   POST /api/plans/{id}/sequence     可行方案的现场执行顺序规划(只读计算)
   POST /api/plans/{id}/jumpers      可行方案的临时供水跨接预览(只读计算)
   POST /api/plans/{id}/monitors     可行方案的失效监测点布设预览(只读计算)
+  POST /api/plans/{id}/tankers      可行方案的应急送水分配预览(只读计算)
   POST /api/demo                    恢复内置示例管网
   POST /api/clear                   清空管网输入
 """
@@ -30,8 +31,8 @@ from pydantic import BaseModel, Field, field_validator
 import database
 from demo import DEMO_NETWORK
 from solver import (MAX_VALVES, NetworkValidationError, plan_jumpers,
-                    plan_monitors, plan_sequence, solve, solve_failover,
-                    solve_siting, solve_tradeoff)
+                    plan_monitors, plan_sequence, plan_tankers, solve,
+                    solve_failover, solve_siting, solve_tradeoff)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -145,6 +146,24 @@ class MonitorIn(BaseModel):
 class MonitorsIn(BaseModel):
     """失效监测点布设预览录入: 至多 12 个候选监测点。"""
     candidates: list[MonitorIn] = Field(default_factory=list)
+
+
+class TankerIn(BaseModel):
+    """应急送水候选车录入。
+
+    各字段(唯一编号/正整数出车费与载水量/可服务的需求点)在
+    solver.plan_tankers 中逐条校验, 以便返回明确错误。
+    """
+    id: Any = None
+    dispatch_cost: Any = None
+    capacity: Any = None
+    serves: Any = None
+
+
+class TankersIn(BaseModel):
+    """应急送水分配预览录入: 需求点需水量 + 至多 6 辆候选车。"""
+    demands: dict[str, Any] = Field(default_factory=dict)
+    candidates: list[TankerIn] = Field(default_factory=list)
 
 
 @asynccontextmanager
@@ -363,6 +382,40 @@ def plan_monitor_preview(plan_id: int, req: MonitorsIn) -> dict:
         result = plan_monitors(plan["network_snapshot"],
                                plan.get("closed_valves", []),
                                [c.model_dump() for c in req.candidates])
+    except NetworkValidationError as exc:
+        raise HTTPException(status_code=422, detail={"errors": exc.errors})
+    result["plan_id"] = plan_id
+    result["solver"] = plan.get("solver", "base")
+    return result
+
+
+@app.post("/api/plans/{plan_id}/tankers")
+def plan_tanker_preview(plan_id: int, req: TankersIn) -> dict:
+    """已保存可行方案的应急送水分配预览(独立 API, 只读计算)。
+
+    以方案快照中关阀后断水的普通节点为需求点, 逐点录入正整数需水量;
+    录入至多 6 辆候选车(唯一编号、正整数出车费与载水量、可服务的需求点),
+    一个需求点可由多车分担; 选出满足全部需求且出车费最低的车辆组合,
+    同费按车辆编号升序列表字典序决胜, 返回各车向各点的配送量与总费用;
+    全部候选车仍无法满足时返回最大可配送量与总缺口; 无断水需求时返回
+    空调度。不修改管网与历史方案。
+    """
+    with database.get_conn() as conn:
+        plan = database.get_plan(conn, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+    if not plan.get("feasible"):
+        reason = plan.get("reason_code")
+        raise HTTPException(status_code=422, detail={"errors": [
+            f"方案 #{plan_id} 为不可行方案"
+            + (f"(reason_code: {reason})" if reason else "")
+            + ", 没有断水需求可作为送水预览的基础, 不能规划应急送水分配"
+        ]})
+    try:
+        result = plan_tankers(plan["network_snapshot"],
+                              plan.get("closed_valves", []),
+                              req.demands,
+                              [c.model_dump() for c in req.candidates])
     except NetworkValidationError as exc:
         raise HTTPException(status_code=422, detail={"errors": exc.errors})
     result["plan_id"] = plan_id

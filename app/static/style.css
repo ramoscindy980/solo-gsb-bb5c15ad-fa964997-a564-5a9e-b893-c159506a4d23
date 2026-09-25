@@ -111,3 +111,6 @@ canvas {
 .tag.closed { background: #fdecea; color: #8a1c14; }
 .tag.dead { background: #eceff3; color: #5a6b7c; }
 .role-name { color: #5a6b7c; }
+.serve-cell { white-space: nowrap; }
+.serve-chk { display: inline-block; margin-right: 10px; font-size: 13px; }
+.serve-chk input { width: auto !important; margin-right: 3px; vertical-align: middle; }

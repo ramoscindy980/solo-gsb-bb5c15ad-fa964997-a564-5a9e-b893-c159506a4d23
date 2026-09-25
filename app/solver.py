@@ -51,6 +51,14 @@
 节点编号升序列表字典序最小的点集, 使任意两种情形在所选点的有水/无水
 读数不同; 候选点无法区分某些情形时列出这些情形对。
 
+以及 plan_tankers(snapshot, closed_valves, raw_demands, raw_candidates):
+已保存可行方案的应急送水分配预览(只读计算)。以方案快照中关阀后断水的
+普通节点为需求点, 逐点录入正整数需水量; 录入至多 6 辆候选车(唯一编号、
+正整数出车费与载水量、可服务的需求点), 一个需求点可由多车分担。枚举
+车辆子集, 用最大流判定能否满足全部需求, 选出出车费最低、同费按车辆
+编号升序列表字典序最小的组合, 返回各车向各点的配送量与总费用; 全部
+候选车仍无法满足时返回最大可配送量与总缺口; 无断水需求时返回空调度。
+
 阀门最多 14 个, 枚举全部 2^V 个子集(V<=14 => 16384), 对每个子集做
 BFS 连通性检查即可, 简单且确定。
 """
@@ -63,6 +71,7 @@ from typing import Any
 MAX_VALVES = 14
 MAX_CANDIDATES = 6
 MAX_MONITOR_CANDIDATES = 12
+MAX_TANKER_CANDIDATES = 6
 
 
 class NetworkValidationError(ValueError):
@@ -1624,4 +1633,299 @@ def plan_monitors(snapshot: dict[str, Any],
         "subset_count": size,
         "distinguishing_subset_count": distinguishing,
         "message": message,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 应急送水分配预览(只读计算, 针对已保存的可行方案)
+# ---------------------------------------------------------------------------
+
+def _max_flow_alloc(vehicles: list[dict[str, Any]],
+                    demand_ids: list[str],
+                    dem: list[int]) -> tuple[int, dict[tuple[int, str], int]]:
+    """送水运输问题最大流(Edmonds-Karp): 车容量 -> 需求点需水量。
+
+    vehicles 为已选候选车(各自含 capacity 与 serves); demand_ids/dem 为
+    需求点编号(升序)与对应需水量。返回 (最大配送量, 配送量字典);
+    配送量字典的键为 (车辆在 vehicles 中的下标, 需求点编号)。
+    邻接按固定下标顺序遍历, 结果确定。需求与容量均为整数, 最大流即
+    整数最优解(运输问题约束矩阵全单模)。
+    """
+    k, d = len(vehicles), len(demand_ids)
+    pidx = {nid: i for i, nid in enumerate(demand_ids)}
+    n = k + d + 2
+    src, sink = 0, n - 1
+    INF = 10 ** 18
+    cap = [[0] * n for _ in range(n)]
+    for a, veh in enumerate(vehicles):
+        cap[src][1 + a] = veh["capacity"]
+        for nid in veh["serves"]:
+            cap[1 + a][1 + k + pidx[nid]] = INF
+    for i in range(d):
+        cap[1 + k + i][sink] = dem[i]
+    total = 0
+    while True:
+        prev = [-1] * n
+        prev[src] = src
+        dq: deque[int] = deque([src])
+        while dq and prev[sink] == -1:
+            u = dq.popleft()
+            for v in range(n):
+                if prev[v] == -1 and cap[u][v] > 0:
+                    prev[v] = u
+                    dq.append(v)
+        if prev[sink] == -1:
+            break
+        b = INF
+        v = sink
+        while v != src:
+            b = min(b, cap[prev[v]][v])
+            v = prev[v]
+        v = sink
+        while v != src:
+            u = prev[v]
+            cap[u][v] -= b
+            cap[v][u] += b
+            v = u
+        total += b
+    # 反向边残量 = 正向净流量: 车 a -> 需求点 i 的配送量
+    alloc: dict[tuple[int, str], int] = {}
+    for a, veh in enumerate(vehicles):
+        for nid in veh["serves"]:
+            f = cap[1 + k + pidx[nid]][1 + a]
+            if f > 0:
+                alloc[(a, nid)] = f
+    return total, alloc
+
+
+def plan_tankers(snapshot: dict[str, Any],
+                 closed_valves: list[str],
+                 raw_demands: Any,
+                 raw_candidates: Any) -> dict[str, Any]:
+    """已保存可行方案的应急送水分配预览(只读计算, 不改方案与管网)。
+
+    以方案快照中**关阀后断水的普通节点**为需求点, 逐点录入正整数需水量
+    (录入的键必须恰好是全部需求点); 录入至多 MAX_TANKER_CANDIDATES 辆
+    候选车, 每辆含唯一编号、正整数出车费、正整数载水量与可服务的需求点
+    (非空)。一个需求点可由多车分担。枚举全部车辆子集(≤2⁶=64), 用最大流
+    判定该组合能否满足全部需求, 在可满足的组合中依次取:
+      1) 出车费合计最小;
+      2) 车辆编号升序列表字典序最小。
+    返回各车向各点的配送量与出车费合计; 全部候选车仍无法满足时, 用全部
+    候选车求**最大可配送量**并给出**总缺口**; 无断水需求时返回空调度。
+    """
+    try:
+        nodes, segments, valves = validate_network(snapshot)
+    except NetworkValidationError as exc:
+        raise NetworkValidationError(
+            ["方案快照数据不合法: " + e for e in exc.errors]) from exc
+
+    errors: list[str] = []
+
+    # ---- 计划关闭阀门必须存在于快照管网中 ----
+    valve_by_id = {vl["id"]: vl for vl in valves}
+    closed = sorted(dict.fromkeys(_norm_id(v) for v in (closed_valves or [])))
+    for vid in closed:
+        if vid not in valve_by_id:
+            errors.append(f"方案关闭的阀门 {vid} 不存在于方案快照的管网中")
+    if errors:
+        raise NetworkValidationError(errors)
+
+    # ---- 需求点: 方案执行后(关闭计划阀门)断水的普通节点 ----
+    g = _Graph(nodes, segments, valves)
+    v_idx = {vl["id"]: b for b, vl in enumerate(g.valves_sorted)}
+    mask = 0
+    for vid in closed:
+        mask |= 1 << v_idx[vid]
+    fed = g.reachable(mask, g.inlet_set)
+    label_of = {nd["id"]: nd["label"] for nd in nodes}
+    demand_ids = sorted(nd["id"] for i, nd in enumerate(nodes)
+                        if nd["role"] == "normal" and not (fed >> i) & 1)
+    demand_set = set(demand_ids)
+
+    # ---- 需水量录入校验: 键恰好是需求点集合, 值为正整数 ----
+    raw_d = raw_demands if isinstance(raw_demands, dict) else {}
+    demands: dict[str, int] = {}
+    missing = [nid for nid in demand_ids if nid not in raw_d]
+    extra = sorted(str(k) for k in raw_d if k not in demand_set)
+    if missing:
+        errors.append("缺少需求点的需水量: " + ", ".join(missing))
+    if extra:
+        errors.append("提供了非需求点的需水量(多余编号): " + ", ".join(extra))
+    for nid in demand_ids:
+        if nid in raw_d:
+            val = _positive_int(raw_d[nid])
+            if val is None:
+                errors.append(f"需求点 {nid} 的需水量必须是正整数, "
+                              f"收到: {raw_d[nid]!r}")
+            else:
+                demands[nid] = val
+    if errors:
+        raise NetworkValidationError(errors)
+
+    # ---- 无断水需求 -> 空调度(不校验候选车) ----
+    if not demand_ids:
+        return {
+            "ok": True,
+            "closed_valves": closed,
+            "demand_points": [],
+            "total_demand": 0,
+            "candidate_count": 0,
+            "combination_count": 0,
+            "feasible_combination_count": 0,
+            "selected_vehicles": [],
+            "selected_ids": [],
+            "total_dispatch_cost": 0,
+            "deliveries": [],
+            "delivered_total": 0,
+            "message": ("应急送水分配预览(只读, 不修改管网与历史方案): "
+                        "方案执行后没有断水的普通节点, 无送水需求, "
+                        "返回空调度(不出车, 出车费合计 0)。"),
+        }
+
+    # ---- 候选车录入校验: 数量 / 唯一编号 / 正整数出车费与载水量 / 可服务点 ----
+    if raw_candidates is None:
+        raw_candidates = []
+    if not isinstance(raw_candidates, list):
+        raise NetworkValidationError(["candidates 必须是数组"])
+    if len(raw_candidates) > MAX_TANKER_CANDIDATES:
+        errors.append(f"候选车数量为 {len(raw_candidates)}, "
+                      f"超过上限 {MAX_TANKER_CANDIDATES} 辆")
+    cands: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for i, cd in enumerate(raw_candidates):
+        if not isinstance(cd, dict):
+            errors.append(f"候选车 #{i + 1}: 必须是对象")
+            continue
+        tid = _norm_id(cd.get("id"))
+        label = tid or f"#{i + 1}"
+        if not tid:
+            errors.append(f"候选车 #{i + 1}: 缺少车辆编号")
+        elif tid in seen_ids:
+            errors.append(f"车辆编号重复: {tid}")
+        seen_ids.add(tid)
+        cost = _positive_int(cd.get("dispatch_cost"))
+        if cost is None:
+            errors.append(f"候选车 {label} 的出车费必须是正整数, "
+                          f"收到: {cd.get('dispatch_cost')!r}")
+        cap = _positive_int(cd.get("capacity"))
+        if cap is None:
+            errors.append(f"候选车 {label} 的载水量必须是正整数, "
+                          f"收到: {cd.get('capacity')!r}")
+        serves_raw = cd.get("serves")
+        serves: list[str] = []
+        if not isinstance(serves_raw, list) or not serves_raw:
+            errors.append(f"候选车 {label} 必须选择至少一个可服务的需求点")
+        else:
+            seen_s: set[str] = set()
+            for s in serves_raw:
+                sid = _norm_id(s)
+                if not sid:
+                    errors.append(f"候选车 {label}: 可服务需求点编号为空")
+                elif sid not in demand_set:
+                    errors.append(
+                        f"候选车 {label}: {sid} 不是断水需求点")
+                elif sid in seen_s:
+                    errors.append(f"候选车 {label}: 可服务需求点重复: {sid}")
+                seen_s.add(sid)
+                if sid in demand_set:
+                    serves.append(sid)
+        cands.append({"id": tid, "dispatch_cost": cost, "capacity": cap,
+                      "serves": sorted(dict.fromkeys(serves))})
+    if errors:
+        raise NetworkValidationError(errors)
+
+    # ---- 枚举车辆子集: 最大流判定可满足性, (出车费, 编号升序列表) 取最优 ----
+    m = len(cands)
+    dem = [demands[nid] for nid in demand_ids]
+    total_demand = sum(dem)
+    demand_points = [{"node_id": nid, "label": label_of[nid],
+                      "demand": demands[nid]} for nid in demand_ids]
+
+    feasible_count = 0
+    best_key: tuple[int, tuple[str, ...]] | None = None
+    best_mask = 0
+    for s in range(1 << m):
+        veh = [cands[j] for j in range(m) if (s >> j) & 1]
+        f, _ = _max_flow_alloc(veh, demand_ids, dem)
+        if f < total_demand:
+            continue
+        feasible_count += 1
+        cost = sum(cands[j]["dispatch_cost"]
+                   for j in range(m) if (s >> j) & 1)
+        ids = tuple(sorted(cands[j]["id"]
+                           for j in range(m) if (s >> j) & 1))
+        key = (cost, ids)
+        if best_key is None or key < best_key:
+            best_key, best_mask = key, s
+
+    def _deliveries(id_order: list[int],
+                    alloc: dict[tuple[int, str], int]) -> list[dict[str, Any]]:
+        out = []
+        for a, j in enumerate(id_order):
+            for nid in cands[j]["serves"]:
+                amt = alloc.get((a, nid), 0)
+                if amt > 0:
+                    out.append({"vehicle_id": cands[j]["id"],
+                                "node_id": nid, "amount": amt})
+        return out
+
+    if best_key is not None:
+        sel_idx = sorted((j for j in range(m) if (best_mask >> j) & 1),
+                         key=lambda j: cands[j]["id"])
+        vehicles = [cands[j] for j in sel_idx]
+        delivered, alloc = _max_flow_alloc(vehicles, demand_ids, dem)
+        sel_ids = [cands[j]["id"] for j in sel_idx]
+        total_cost = sum(cands[j]["dispatch_cost"] for j in sel_idx)
+        return {
+            "ok": True,
+            "closed_valves": closed,
+            "demand_points": demand_points,
+            "total_demand": total_demand,
+            "candidate_count": m,
+            "combination_count": 1 << m,
+            "feasible_combination_count": feasible_count,
+            "selected_vehicles": [
+                {"id": cands[j]["id"],
+                 "dispatch_cost": cands[j]["dispatch_cost"],
+                 "capacity": cands[j]["capacity"],
+                 "serves": cands[j]["serves"]} for j in sel_idx],
+            "selected_ids": sel_ids,
+            "total_dispatch_cost": total_cost,
+            "deliveries": _deliveries(sel_idx, alloc),
+            "delivered_total": delivered,
+            "message": (
+                f"应急送水分配预览(只读, 不修改管网与历史方案): 断水需求点 "
+                f"{len(demand_ids)} 个, 总需求 {total_demand}; 出车 "
+                f"{len(sel_ids)} 辆({', '.join(sel_ids)}), 出车费合计 "
+                f"{total_cost}, 配送总量 {delivered}, 全部需求得到满足。"),
+        }
+
+    # ---- 全部候选车也无法满足: 用全部候选求最大可配送量与总缺口 ----
+    id_order = sorted(range(m), key=lambda j: cands[j]["id"])
+    max_deliv, alloc = _max_flow_alloc([cands[j] for j in id_order],
+                                       demand_ids, dem)
+    per_point = []
+    for i, nid in enumerate(demand_ids):
+        got = sum(alloc.get((a, nid), 0) for a in range(m))
+        per_point.append({"node_id": nid, "demand": dem[i],
+                          "delivered": got, "shortage": dem[i] - got})
+    return {
+        "ok": False,
+        "reason_code": "INSUFFICIENT_DELIVERY_CAPACITY",
+        "closed_valves": closed,
+        "demand_points": demand_points,
+        "total_demand": total_demand,
+        "candidate_count": m,
+        "combination_count": 1 << m,
+        "feasible_combination_count": feasible_count,
+        "max_deliverable": max_deliv,
+        "shortage": total_demand - max_deliv,
+        "per_point": per_point,
+        "deliveries": _deliveries(id_order, alloc),
+        "message": (
+            f"应急送水分配预览(只读, 不修改管网与历史方案): 断水需求点 "
+            f"{len(demand_ids)} 个, 总需求 {total_demand}; 全部候选车 "
+            f"({m} 辆)最大可配送 {max_deliv}, 仍无法满足全部需求, "
+            f"总缺口 {total_demand - max_deliv}。"),
     }
