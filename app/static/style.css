@@ -111,3 +111,12 @@ canvas {
 .tag.closed { background: #fdecea; color: #8a1c14; }
 .tag.dead { background: #eceff3; color: #5a6b7c; }
 .role-name { color: #5a6b7c; }
+.inline-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-right: 8px;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.inline-check input { width: auto; }

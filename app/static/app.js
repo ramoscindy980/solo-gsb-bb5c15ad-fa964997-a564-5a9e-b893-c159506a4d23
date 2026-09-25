@@ -336,6 +336,7 @@ function renderResult(r) {
     appendSequencePanel(r);
     appendJumperPanel(r);
     appendMonitorPanel(r);
+    appendWaterDeliveryPanel(r);
     drawCanvas();
     return;
   }
@@ -363,6 +364,7 @@ function renderResult(r) {
   appendSequencePanel(r);
   appendJumperPanel(r);
   appendMonitorPanel(r);
+  appendWaterDeliveryPanel(r);
   drawCanvas();
 }
 
@@ -1035,6 +1037,210 @@ function renderMonitorResult(res, box) {
     <p class="role-name">优化次序: 先最小化布设费合计, 同费按节点编号升序列表字典序最小。</p>
     <h4>各情形在所选点的读数（任意两种情形读数不同）</h4>
     ${monitorReadingsMatrix(res.scenarios)}`;
+}
+
+// ---------- 应急送水分配预览 ----------
+// 入口: 可行方案详情(历史方案"查看"或刚求解出的方案)下方的预览卡片。
+// 只读计算, 不修改管网与历史方案。
+function appendWaterDeliveryPanel(r) {
+  if (r.id == null) return; // 未入库结果不提供预览入口
+  const body = $("#result-body");
+  const card = document.createElement("div");
+  card.className = "card";
+  card.id = "water-card";
+
+  // 需求点 = 方案快照中关阀后断水的普通节点
+  const demandNodes = (r.node_status || [])
+    .filter((n) => n.role === "normal" && n.status === "disconnected")
+    .map((n) => ({ id: n.id, label: n.label }));
+
+  if (!demandNodes.length) {
+    card.innerHTML = `
+      <h3>应急送水分配预览</h3>
+      <p class="role-name">方案执行后没有断水的普通节点, 无需应急送水, 空调度(总费用 0)。</p>`;
+    body.appendChild(card);
+    return;
+  }
+
+  card.innerHTML = `
+    <h3>应急送水分配预览 <span class="role-name">(只读计算, 不修改管网与历史方案)</span></h3>
+    <p class="role-name">
+      以方案快照中关阀后断水的普通节点为需求点, 逐点录入<b>正整数需水量</b>;
+      录入至多 6 辆候选送水车, 每辆含<b>唯一编号</b>、<b>正整数出车费</b>与
+      <b>载水量</b>, 勾选可服务的需求点。允许一个需求点由多车分担; 系统枚举全部
+      车辆组合, 选出满足全部需求且<b>出车费最低</b>的组合, 同费按<b>车辆编号升序
+      列表</b>字典序决胜; 全部候选车仍无法满足时给出最大可配送量与总缺口。
+    </p>
+    <h4>断水需求点需水量</h4>
+    <table id="table-water-demands"><thead><tr>
+      <th>需求点</th><th>名称</th><th>需水量（正整数）</th>
+    </tr></thead><tbody>
+      ${demandNodes.map((n) => `<tr>
+        <td><b>${esc(n.id)}</b></td>
+        <td>${esc(n.label || n.id)}</td>
+        <td><input data-did="${esc(n.id)}" type="number" min="1" step="1" value="1"></td>
+      </tr>`).join("")}
+    </tbody></table>
+    <h4>候选送水车（至多 6 辆）</h4>
+    <table id="table-water-vehicles"><thead><tr>
+      <th>车辆编号</th><th>出车费</th><th>载水量</th><th>可服务需求点</th><th></th>
+    </tr></thead><tbody></tbody></table>
+    <button id="btn-add-water-vehicle" class="add-row" type="button">＋ 添加候选车辆</button>
+    <p>
+      <button id="btn-water" type="button" class="primary">送水分配预览求解</button>
+      <span class="role-name" id="water-hint"></span>
+    </p>
+    <div id="water-errors" class="errors hidden"></div>
+    <div id="water-result"></div>`;
+  body.appendChild(card);
+
+  const vehicles = []; // 本地候选: {id, cost, capacity, serves: string[]}
+  const tbody = card.querySelector("#table-water-vehicles tbody");
+
+  function serveChecks(i) {
+    return demandNodes.map((n) => `
+      <label class="inline-check">
+        <input type="checkbox" data-serve="${esc(n.id)}"${
+          vehicles[i].serves.includes(n.id) ? " checked" : ""}> ${esc(n.id)}
+      </label>`).join(" ");
+  }
+
+  function renderRows() {
+    tbody.innerHTML = vehicles.map((v, i) => `
+      <tr data-i="${i}">
+        <td><input data-f="id" value="${esc(v.id)}" placeholder="如 T1"></td>
+        <td><input data-f="cost" type="number" min="1" step="1" value="${esc(v.cost)}" style="width:6em"></td>
+        <td><input data-f="capacity" type="number" min="1" step="1" value="${esc(v.capacity)}" style="width:6em"></td>
+        <td>${serveChecks(i)}</td>
+        <td class="act"><button data-del="${i}" title="删除">✕</button></td>
+      </tr>`).join("");
+    card.querySelector("#water-hint").textContent =
+      `候选车辆 ${vehicles.length} 辆（至多 6 辆）；预览只读`;
+  }
+
+  card.querySelector("#btn-add-water-vehicle").addEventListener("click", () => {
+    if (vehicles.length >= 6) {
+      const errBox = card.querySelector("#water-errors");
+      errBox.innerHTML = "<b>候选送水车最多 6 辆</b>";
+      errBox.classList.remove("hidden");
+      return;
+    }
+    vehicles.push({ id: "", cost: 1, capacity: 1, serves: [] });
+    renderRows();
+  });
+  tbody.addEventListener("input", (e) => {
+    const tr = e.target.closest("tr");
+    if (!tr) return;
+    const i = Number(tr.dataset.i);
+    const f = e.target.dataset.f;
+    if (f === "id") vehicles[i][f] = e.target.value;
+    else if (f === "cost" || f === "capacity") vehicles[i][f] = Number(e.target.value);
+  });
+  tbody.addEventListener("change", (e) => {
+    const cb = e.target.closest("input[data-serve]");
+    if (!cb) return;
+    const i = Number(cb.closest("tr").dataset.i);
+    const nid = cb.dataset.serve;
+    if (cb.checked) {
+      if (!vehicles[i].serves.includes(nid)) vehicles[i].serves.push(nid);
+    } else {
+      vehicles[i].serves = vehicles[i].serves.filter((x) => x !== nid);
+    }
+  });
+  tbody.addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-del]");
+    if (!btn) return;
+    vehicles.splice(Number(btn.dataset.del), 1);
+    renderRows();
+  });
+  card.querySelector("#btn-water").addEventListener("click", async () => {
+    const errBox = card.querySelector("#water-errors");
+    const resBox = card.querySelector("#water-result");
+    errBox.classList.add("hidden");
+    resBox.innerHTML = "";
+    const demands = {};
+    card.querySelectorAll("#table-water-demands input[data-did]").forEach((inp) => {
+      demands[inp.dataset.did] = inp.value.trim() === "" ? null : Number(inp.value);
+    });
+    const payloadVehicles = vehicles
+      .filter((v) => v.id.trim())
+      .map((v) => ({
+        id: v.id.trim(), cost: v.cost, capacity: v.capacity,
+        serves: v.serves,
+      }));
+    try {
+      const res = await api("POST", `/api/plans/${r.id}/water-delivery`, {
+        demands, vehicles: payloadVehicles,
+      });
+      renderWaterResult(res, resBox);
+    } catch (err) {
+      errBox.innerHTML = `<b>无法求解送水分配预览:</b><ul>${
+        String(err.message).split("\n").map((e) => `<li>${esc(e)}</li>`).join("")}</ul>`;
+      errBox.classList.remove("hidden");
+    }
+  });
+  renderRows();
+}
+
+function renderWaterResult(res, box) {
+  const nodeCols = (res.demand_nodes || []).map((n) => n.id);
+  const headRow = `<tr><th>车辆</th><th>出车费</th><th>载水量</th>
+    ${nodeCols.map((id) => `<th>${esc(id)}</th>`).join("")}
+    <th>本车配送合计</th></tr>`;
+  const bodyRows = res.delivery_matrix.length
+    ? res.delivery_matrix.map((row) => {
+        const amountOf = new Map(row.deliveries.map((d) => [d.node_id, d.amount]));
+        return `<tr><td><b>${esc(row.vehicle_id)}</b></td>
+          <td>${esc(row.cost)}</td><td>${esc(row.capacity)}</td>
+          ${nodeCols.map((id) => `<td>${amountOf.get(id) || 0}</td>`).join("")}
+          <td><b>${row.delivered_total}</b></td></tr>`;
+      }).join("")
+    : `<tr><td colspan="${nodeCols.length + 4}" class="role-name">无候选车辆</td></tr>`;
+
+  const nodeRows = (res.node_summary || []).map((ns) => `
+    <tr>
+      <td><b>${esc(ns.node_id)}</b>${
+        ns.label && ns.label !== ns.node_id ? ` <span class="role-name">(${esc(ns.label)})</span>` : ""}
+      </td>
+      <td>${ns.demand}</td>
+      <td>${ns.delivered}</td>
+      <td>${ns.shortage > 0
+        ? `<span class="tag leak_not_isolated">${ns.shortage}</span>`
+        : '<span class="tag supplied">0</span>'}</td>
+      <td>${ns.by_vehicle.length
+        ? ns.by_vehicle.map((b) => `${esc(b.vehicle_id)}: ${b.amount}`).join("，")
+        : "—"}</td>
+    </tr>`).join("");
+
+  const banner = res.satisfied
+    ? `<div class="banner ok">
+        <span class="big">✓ 全部需求满足</span>${esc(res.message)}
+        <br><small>共枚举 ${res.combination_count} 个车辆组合, 其中
+        ${res.feasible_combination_count} 个可满足全部需求。
+        本结果为只读预览, 未修改管网与历史方案。</small>
+      </div>
+      <h4>选派车辆（${res.selected_vehicle_ids.length} 辆, 出车费合计 ${res.total_cost}）</h4>
+      <p>${res.selected_vehicle_ids.length
+        ? res.selected_vehicle_ids.map(esc).join(", ")
+        : "无（无需送水）"}</p>
+      <p class="role-name">优化次序: 先最小化出车费合计, 同费按车辆编号升序列表字典序决胜;
+      配送量按需求点、车辆编号双关键字贪心确定, 结果唯一。</p>`
+    : `<div class="banner bad">
+        <span class="big">✗ 候选车无法满足全部需求</span>${esc(res.message)}
+        <br><small>本结果为只读预览, 未修改管网与历史方案。</small>
+      </div>`;
+
+  box.innerHTML = `
+    ${banner}
+    <h4>各车向各点配送量（整数水量, 允许多车分担同一点）</h4>
+    <table><thead>${headRow}</thead><tbody>${bodyRows}</tbody></table>
+    <h4>各需求点满足情况</h4>
+    <table><thead><tr>
+      <th>需求点</th><th>需水量</th><th>已配送</th><th>缺口</th><th>分担车辆与水量</th>
+    </tr></thead><tbody>${nodeRows}</tbody></table>
+    <p class="role-name">合计: 需水 ${res.total_demand},
+    最大可配送 ${res.delivered_total}, 总缺口 <b>${res.shortage_total}</b>,
+    出车费总计 ${res.satisfied ? res.total_cost : "不产生（未选出可行车队）"}。</p>`;
 }
 
 // ---------- 历史 ----------
